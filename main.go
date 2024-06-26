@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"os"
 
-	"github.com/dagger/dagger"
-	"github.com/docker/docker/api/types"
+	"dagger.io/dagger"
 	"github.com/docker/docker/client"
 )
 
@@ -23,61 +24,80 @@ func main() {
 
 	// Define the repository and build pack
 	repoURL := "https://github.com/rianfowler/backstage-dagger-demo.git"
-	buildPack := "heroku/buildpacks:18"
 
 	// Clone the GitHub repository
-	repo := client.Git(repoURL).WithDir("/workspace")
+	repo := client.Git(repoURL).Branch("main").Tree()
+
+	// Sync the repository
+	dir, err := repo.Sync(ctx)
+	if err != nil {
+		fmt.Println("Failed to sync repository:", err)
+		return
+	}
 
 	// Define the build pack container
 	buildContainer := client.Container().
-		From(buildPack).
-		WithMountedDirectory("/workspace", repo)
+		From("paketobuildpacks/builder:base").
+		WithMountedDirectory("/workspace", dir).
+		WithWorkdir("/workspace").
+		WithExec([]string{"pack", "build", "my-app"})
 
-	// Build the project
-	buildResult := buildContainer.Exec(dagger.ContainerExecOpts{
-		Args: []string{"npm", "install", "--prefix", "/workspace"},
-	})
-
-	if buildResult.ExitCode != 0 {
-		fmt.Println("Build failed with exit code:", buildResult.ExitCode)
+	// Check the build result
+	buildResult, err := buildContainer.Sync(ctx)
+	if err != nil {
+		fmt.Println("Build failed:", err)
 		return
 	}
 
 	// Tag the built image
 	imageName := "dagger-backstage-demo:latest"
-	pushResult := buildContainer.Publish(ctx, imageName)
-	if pushResult != nil {
-		fmt.Println("Failed to publish image:", pushResult)
+	tarPath := "./dagger-backstage-demo.tar"
+	_, err = buildResult.Export(ctx, tarPath)
+	if err != nil {
+		fmt.Println("Failed to export image:", err)
+		return
+	}
+	if err != nil {
+		fmt.Println("Failed to export image:", err)
 		return
 	}
 
-	// Push to local Docker host
-	err = pushToLocalDocker(ctx, imageName)
+	// Load the image into the local Docker daemon
+	err = loadImageToLocalDocker(ctx, tarPath)
 	if err != nil {
-		fmt.Println("Failed to push image to local Docker host:", err)
+		fmt.Println("Failed to load image into local Docker daemon:", err)
 		return
 	}
 
 	fmt.Println("Image published successfully:", imageName)
 }
 
-// pushToLocalDocker pushes the image to the local Docker host
-func pushToLocalDocker(ctx context.Context, imageName string) error {
+// loadImageToLocalDocker loads the image from a tar file into the local Docker daemon
+func loadImageToLocalDocker(ctx context.Context, tarPath string) error {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return err
 	}
 
-	out, err := cli.ImagePush(ctx, imageName, types.ImagePushOptions{RegistryAuth: "unused"})
+	tarFile, err := os.Open(tarPath)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	defer tarFile.Close()
 
-	// Read the output
+	imageLoadResponse, err := cli.ImageLoad(ctx, tarFile, true)
+	if err != nil {
+		return err
+	}
+	defer imageLoadResponse.Body.Close()
+
+	// Read the response
 	buf := new(bytes.Buffer)
-	buf.ReadFrom(out)
-	fmt.Println(buf.String())
+	_, err = io.Copy(buf, imageLoadResponse.Body)
+	if err != nil {
+		return err
+	}
 
+	fmt.Println(buf.String())
 	return nil
 }
